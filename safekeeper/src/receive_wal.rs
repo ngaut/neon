@@ -88,7 +88,7 @@ impl<'pg> ReceiveWalConn<'pg> {
         // Register the connection and defer unregister.
         spg.timeline
             .get()
-            .on_compute_connect(self.pageserver_connstr.as_ref())?;
+            .on_compute_connect(self.pageserver_connstr.clone())?;
         let _guard = ComputeConnectionGuard {
             timeline: Arc::clone(spg.timeline.get()),
         };

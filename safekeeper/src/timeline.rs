@@ -15,7 +15,6 @@ use std::fs::{self};
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
-use tokio::sync::mpsc::UnboundedSender;
 use tracing::*;
 
 use utils::{
@@ -23,8 +22,6 @@ use utils::{
     pq_proto::ZenithFeedback,
     zid::{NodeId, ZTenantId, ZTenantTimelineId},
 };
-
-use crate::callmemaybe::{CallmeEvent, SubscriptionStateKey};
 
 use crate::control_file;
 use crate::safekeeper::{
@@ -136,80 +133,28 @@ impl SharedState {
         })
     }
 
-    /// Activate the timeline: start/change walsender (via callmemaybe).
+    /// Activate the timeline: start/change timeline information propagated into etcd for further pageserver connections.
     fn activate(
         &mut self,
         zttid: &ZTenantTimelineId,
-        pageserver_connstr: Option<&String>,
-        callmemaybe_tx: &UnboundedSender<CallmeEvent>,
+        pageserver_connstr: Option<String>,
     ) -> Result<()> {
-        if let Some(ref pageserver_connstr) = self.pageserver_connstr {
-            // unsub old sub. xxx: callmemaybe is going out
-            let old_subscription_key = SubscriptionStateKey::new(
-                zttid.tenant_id,
-                zttid.timeline_id,
-                pageserver_connstr.to_owned(),
-            );
-            callmemaybe_tx
-                .send(CallmeEvent::Unsubscribe(old_subscription_key))
-                .unwrap_or_else(|e| {
-                    error!("failed to send Pause request to callmemaybe thread {}", e);
-                });
-        }
-        if let Some(pageserver_connstr) = pageserver_connstr {
-            let subscription_key = SubscriptionStateKey::new(
-                zttid.tenant_id,
-                zttid.timeline_id,
-                pageserver_connstr.to_owned(),
-            );
-            // xx: sending to channel under lock is not very cool, but
-            // shouldn't be a problem here. If it is, we can grab a counter
-            // here and later augment channel messages with it.
-            callmemaybe_tx
-                .send(CallmeEvent::Subscribe(subscription_key))
-                .unwrap_or_else(|e| {
-                    error!(
-                        "failed to send Subscribe request to callmemaybe thread {}",
-                        e
-                    );
-                });
-            info!(
-                "timeline {} is subscribed to callmemaybe to {}",
-                zttid.timeline_id, pageserver_connstr
-            );
-        }
-        self.pageserver_connstr = pageserver_connstr.map(|c| c.to_owned());
+        info!(
+            "timeline {} is activated with connstr {pageserver_connstr:?}",
+            zttid.timeline_id
+        );
+        self.pageserver_connstr = pageserver_connstr;
         self.active = true;
         Ok(())
     }
 
-    /// Deactivate the timeline: stop callmemaybe.
-    fn deactivate(
-        &mut self,
-        zttid: &ZTenantTimelineId,
-        callmemaybe_tx: &UnboundedSender<CallmeEvent>,
-    ) -> Result<()> {
+    /// Deactivate the timeline: stop its data propagation to etcd and possible pageserver connections.
+    fn deactivate(&mut self, zttid: &ZTenantTimelineId) -> Result<()> {
         if self.active {
-            if let Some(ref pageserver_connstr) = self.pageserver_connstr {
-                let subscription_key = SubscriptionStateKey::new(
-                    zttid.tenant_id,
-                    zttid.timeline_id,
-                    pageserver_connstr.to_owned(),
-                );
-                callmemaybe_tx
-                    .send(CallmeEvent::Unsubscribe(subscription_key))
-                    .unwrap_or_else(|e| {
-                        error!(
-                            "failed to send Unsubscribe request to callmemaybe thread {}",
-                            e
-                        );
-                    });
-                info!(
-                    "timeline {} is unsubscribed from callmemaybe to {}",
-                    zttid.timeline_id,
-                    self.pageserver_connstr.as_ref().unwrap()
-                );
-            }
+            info!(
+                "timeline {} is deactivated from connstr {:?}",
+                zttid.timeline_id, self.pageserver_connstr,
+            );
             self.active = false;
         }
         Ok(())
@@ -277,21 +222,15 @@ impl SharedState {
 /// Database instance (tenant)
 pub struct Timeline {
     pub zttid: ZTenantTimelineId,
-    pub callmemaybe_tx: UnboundedSender<CallmeEvent>,
     mutex: Mutex<SharedState>,
     /// conditional variable used to notify wal senders
     cond: Condvar,
 }
 
 impl Timeline {
-    fn new(
-        zttid: ZTenantTimelineId,
-        callmemaybe_tx: UnboundedSender<CallmeEvent>,
-        shared_state: SharedState,
-    ) -> Timeline {
+    fn new(zttid: ZTenantTimelineId, shared_state: SharedState) -> Timeline {
         Timeline {
             zttid,
-            callmemaybe_tx,
             mutex: Mutex::new(shared_state),
             cond: Condvar::new(),
         }
@@ -300,14 +239,14 @@ impl Timeline {
     /// Register compute connection, starting timeline-related activity if it is
     /// not running yet.
     /// Can fail only if channel to a static thread got closed, which is not normal at all.
-    pub fn on_compute_connect(&self, pageserver_connstr: Option<&String>) -> Result<()> {
+    pub fn on_compute_connect(&self, pageserver_connstr: Option<String>) -> Result<()> {
         let mut shared_state = self.mutex.lock().unwrap();
         shared_state.num_computes += 1;
         // FIXME: currently we always adopt latest pageserver connstr, but we
         // should have kind of generations assigned by compute to distinguish
         // the latest one or even pass it through consensus to reliably deliver
         // to all safekeepers.
-        shared_state.activate(&self.zttid, pageserver_connstr, &self.callmemaybe_tx)?;
+        shared_state.activate(&self.zttid, pageserver_connstr)?;
         Ok(())
     }
 
@@ -320,7 +259,7 @@ impl Timeline {
         // If there is no pageserver, can suspend right away; otherwise let
         // walsender do that.
         if shared_state.num_computes == 0 && shared_state.pageserver_connstr.is_none() {
-            shared_state.deactivate(&self.zttid, &self.callmemaybe_tx)?;
+            shared_state.deactivate(&self.zttid)?;
         }
         Ok(())
     }
@@ -340,7 +279,7 @@ impl Timeline {
             (replica_state.last_received_lsn != Lsn::MAX && // Lsn::MAX means that we don't know the latest LSN yet.
              replica_state.last_received_lsn >= shared_state.sk.inmem.commit_lsn);
             if deactivate {
-                shared_state.deactivate(&self.zttid, &self.callmemaybe_tx)?;
+                shared_state.deactivate(&self.zttid)?;
                 return Ok(true);
             }
         }
@@ -357,7 +296,7 @@ impl Timeline {
     pub fn deactivate_for_delete(&self) -> Result<bool> {
         let mut shared_state = self.mutex.lock().unwrap();
         let was_active = shared_state.active;
-        shared_state.deactivate(&self.zttid, &self.callmemaybe_tx)?;
+        shared_state.deactivate(&self.zttid)?;
         Ok(was_active)
     }
 
@@ -443,7 +382,8 @@ impl Timeline {
                 shared_state.sk.inmem.remote_consistent_lsn,
             )),
             peer_horizon_lsn: Some(shared_state.sk.inmem.peer_horizon_lsn),
-            safekeeper_connection_string: Some(conf.listen_pg_addr.clone()),
+            safekeeper_connstr: Some(conf.listen_pg_addr.clone()),
+            pageserver_connstr: shared_state.pageserver_connstr.clone(),
         })
     }
 
@@ -521,13 +461,11 @@ impl TimelineTools for Option<Arc<Timeline>> {
 
 struct GlobalTimelinesState {
     timelines: HashMap<ZTenantTimelineId, Arc<Timeline>>,
-    callmemaybe_tx: Option<UnboundedSender<CallmeEvent>>,
 }
 
 lazy_static! {
     static ref TIMELINES_STATE: Mutex<GlobalTimelinesState> = Mutex::new(GlobalTimelinesState {
         timelines: HashMap::new(),
-        callmemaybe_tx: None
     });
 }
 
@@ -541,12 +479,6 @@ pub struct TimelineDeleteForceResult {
 pub struct GlobalTimelines;
 
 impl GlobalTimelines {
-    pub fn set_callmemaybe_tx(callmemaybe_tx: UnboundedSender<CallmeEvent>) {
-        let mut state = TIMELINES_STATE.lock().unwrap();
-        assert!(state.callmemaybe_tx.is_none());
-        state.callmemaybe_tx = Some(callmemaybe_tx);
-    }
-
     fn create_internal(
         mut state: MutexGuard<GlobalTimelinesState>,
         conf: &SafeKeeperConf,
@@ -562,11 +494,7 @@ impl GlobalTimelines {
                 let shared_state = SharedState::create(conf, &zttid, peer_ids)
                     .context("failed to create shared state")?;
 
-                let new_tli = Arc::new(Timeline::new(
-                    zttid,
-                    state.callmemaybe_tx.as_ref().unwrap().clone(),
-                    shared_state,
-                ));
+                let new_tli = Arc::new(Timeline::new(zttid, shared_state));
                 state.timelines.insert(zttid, Arc::clone(&new_tli));
                 Ok(new_tli)
             }
@@ -614,11 +542,7 @@ impl GlobalTimelines {
                     }
                 };
 
-                let new_tli = Arc::new(Timeline::new(
-                    zttid,
-                    state.callmemaybe_tx.as_ref().unwrap().clone(),
-                    shared_state,
-                ));
+                let new_tli = Arc::new(Timeline::new(zttid, shared_state));
                 state.timelines.insert(zttid, Arc::clone(&new_tli));
                 Ok(new_tli)
             }

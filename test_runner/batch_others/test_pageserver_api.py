@@ -1,5 +1,5 @@
 from uuid import uuid4, UUID
-import pytest
+import pytest, time
 from fixtures.zenith_fixtures import (
     DEFAULT_BRANCH_NAME,
     ZenithEnv,
@@ -60,10 +60,11 @@ def test_pageserver_http_get_wal_receiver_not_found(zenith_simple_env: ZenithEnv
 
     tenant_id, timeline_id = env.zenith_cli.create_tenant()
 
-    # no PG compute node is running, so no WAL receiver is running
-    with pytest.raises(ZenithPageserverApiException) as e:
-        _ = client.wal_receiver_get(tenant_id, timeline_id)
-        assert "Not Found" in str(e.value)
+    empty_response = client.wal_receiver_get(tenant_id, timeline_id)
+
+    assert empty_response.get('wal_producer_connstr') is None, 'Should not be able to connect to WAL streaming without PG compute node running'
+    assert empty_response.get('last_received_msg_lsn') is None, 'Should not be able to connect to WAL streaming without PG compute node running'
+    assert empty_response.get('last_received_msg_ts') is None, 'Should not be able to connect to WAL streaming without PG compute node running'
 
 
 def test_pageserver_http_get_wal_receiver_success(zenith_simple_env: ZenithEnv):
@@ -73,18 +74,25 @@ def test_pageserver_http_get_wal_receiver_success(zenith_simple_env: ZenithEnv):
     tenant_id, timeline_id = env.zenith_cli.create_tenant()
     pg = env.postgres.create_start(DEFAULT_BRANCH_NAME, tenant_id=tenant_id)
 
-    res = client.wal_receiver_get(tenant_id, timeline_id)
-    assert list(res.keys()) == [
-        "thread_id",
-        "wal_producer_connstr",
-        "last_received_msg_lsn",
-        "last_received_msg_ts",
-    ]
+    res = {}
+    for _ in range(10):
+        res = client.wal_receiver_get(tenant_id, timeline_id)
+        assert list(res.keys()) == [
+            "wal_producer_connstr",
+            "last_received_msg_lsn",
+            "last_received_msg_ts",
+        ]
+        if res.get('last_received_msg_lsn') is not None:
+            break
+        time.sleep(1)
+    assert res.get('last_received_msg_lsn') is not None, 'no wal message got posted for the timeline'
+    assert res.get('wal_producer_connstr') is not None, 'no wal receiver connection string was recorded'
 
     # make a DB modification then expect getting a new WAL receiver's data
     pg.safe_psql("CREATE TABLE t(key int primary key, value text)")
     res2 = client.wal_receiver_get(tenant_id, timeline_id)
     assert res2["last_received_msg_lsn"] > res["last_received_msg_lsn"]
+    assert res2.get('wal_producer_connstr') is not None, 'no wal receiver connection string was recorded'
 
 
 def test_pageserver_http_api_client(zenith_simple_env: ZenithEnv):

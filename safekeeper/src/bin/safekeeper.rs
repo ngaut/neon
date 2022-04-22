@@ -10,17 +10,15 @@ use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
-use tokio::sync::mpsc;
 use tracing::*;
 use url::{ParseError, Url};
 
+use safekeeper::broker;
 use safekeeper::control_file::{self};
 use safekeeper::defaults::{DEFAULT_HTTP_LISTEN_ADDR, DEFAULT_PG_LISTEN_ADDR};
 use safekeeper::remove_wal;
-use safekeeper::timeline::GlobalTimelines;
 use safekeeper::wal_service;
 use safekeeper::SafeKeeperConf;
-use safekeeper::{broker, callmemaybe};
 use safekeeper::{http, s3_offload};
 use utils::{
     http::endpoint, logging, project_git_version, shutdown::exit_now, signals, tcp_listener,
@@ -251,8 +249,6 @@ fn start_safekeeper(mut conf: SafeKeeperConf, given_id: Option<NodeId>, init: bo
 
     let signals = signals::install_shutdown_handlers()?;
     let mut threads = vec![];
-    let (callmemaybe_tx, callmemaybe_rx) = mpsc::unbounded_channel();
-    GlobalTimelines::set_callmemaybe_tx(callmemaybe_tx);
 
     let conf_ = conf.clone();
     threads.push(
@@ -285,28 +281,13 @@ fn start_safekeeper(mut conf: SafeKeeperConf, given_id: Option<NodeId>, init: bo
     let safekeeper_thread = thread::Builder::new()
         .name("Safekeeper thread".into())
         .spawn(|| {
-            // thread code
-            let thread_result = wal_service::thread_main(conf_cloned, pg_listener);
-            if let Err(e) = thread_result {
-                info!("safekeeper thread terminated: {}", e);
+            if let Err(e) = wal_service::thread_main(conf_cloned, pg_listener) {
+                info!("safekeeper thread terminated: {e}");
             }
         })
         .unwrap();
 
     threads.push(safekeeper_thread);
-
-    let conf_cloned = conf.clone();
-    let callmemaybe_thread = thread::Builder::new()
-        .name("callmemaybe thread".into())
-        .spawn(|| {
-            // thread code
-            let thread_result = callmemaybe::thread_main(conf_cloned, callmemaybe_rx);
-            if let Err(e) = thread_result {
-                error!("callmemaybe thread terminated: {}", e);
-            }
-        })
-        .unwrap();
-    threads.push(callmemaybe_thread);
 
     if !conf.broker_endpoints.is_empty() {
         let conf_ = conf.clone();
