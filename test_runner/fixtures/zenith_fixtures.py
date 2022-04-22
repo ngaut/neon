@@ -1588,8 +1588,6 @@ class Postgres(PgProtocol):
             for cfg_line in cfg_lines:
                 # walproposer uses different application_name
                 if ("synchronous_standby_names" in cfg_line or
-                        # don't ask pageserver to fetch WAL from compute
-                        "callmemaybe_connstring" in cfg_line or
                         # don't repeat safekeepers/wal_acceptors multiple times
                         "wal_acceptors" in cfg_line):
                     continue

@@ -13,16 +13,13 @@ from fixtures.zenith_fixtures import ZenithEnvBuilder
 
 
 @pytest.mark.parametrize('tenants_count', [1, 5, 10])
-@pytest.mark.parametrize('use_safekeepers', ['with_wa', 'without_wa'])
 def test_bulk_tenant_create(
     zenith_env_builder: ZenithEnvBuilder,
     use_safekeepers: str,
     tenants_count: int,
     zenbenchmark,
 ):
-    """Measure tenant creation time (with and without wal acceptors)"""
-    if use_safekeepers == 'with_wa':
-        zenith_env_builder.num_safekeepers = 3
+    zenith_env_builder.num_safekeepers = 3
     env = zenith_env_builder.init_start()
 
     time_slices = []

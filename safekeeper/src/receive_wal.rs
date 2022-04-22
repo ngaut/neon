@@ -85,6 +85,14 @@ impl<'pg> ReceiveWalConn<'pg> {
             _ => bail!("unexpected message {:?} instead of greeting", next_msg),
         }
 
+        // Register the connection and defer unregister.
+        spg.timeline
+            .get()
+            .on_compute_connect(self.pageserver_connstr.as_ref())?;
+        let _guard = ComputeConnectionGuard {
+            timeline: Arc::clone(spg.timeline.get()),
+        };
+
         let mut next_msg = Some(next_msg);
 
         let mut first_time_through = true;
