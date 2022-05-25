@@ -114,7 +114,9 @@ pub fn init_wal_receiver_main_thread(
         etcd_endpoints.iter().map(Url::to_string).join(", ")
     );
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .thread_name("wal-receiver-runtime-thread")
+        .worker_threads(40)
         .enable_all()
         .build()
         .context("Failed to create storage sync runtime")?;
