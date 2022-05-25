@@ -54,7 +54,7 @@ use etcd_broker::{Client, SkTimelineInfo, SkTimelineSubscription, SkTimelineSubs
 use itertools::Itertools;
 use once_cell::sync::Lazy;
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map, HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -181,12 +181,14 @@ async fn wal_receiver_main_thread_loop_step<'a>(
                 LocalTimelineUpdate::Detach(id) => {
                     match local_timeline_wal_receivers.get_mut(&id.tenant_id) {
                         Some(wal_receivers) => {
-                            if let Some(handles) = wal_receivers.remove(&id.timeline_id) {
-                                if let Err(e) = handles.shutdown(id).await {
+                            if let hash_map::Entry::Occupied(mut o) = wal_receivers.entry(id.timeline_id) {
+                                if let Err(e) = o.get_mut().shutdown(id).await {
                                     error!("Failed to shut down timeline {id} wal receiver handle: {e:#}");
                                     return;
+                                } else {
+                                    o.remove();
                                 }
-                            };
+                            }
                             if wal_receivers.is_empty() {
                                 if let Err(e) = change_tenant_state(id.tenant_id, TenantState::Idle).await {
                                     error!("Failed to make tenant idle for id {id}: {e:#}");
@@ -212,19 +214,15 @@ async fn wal_receiver_main_thread_loop_step<'a>(
                             error!("Failed to make tenant active for id {new_id}: {e:#}");
                             return;
                         }
-                    } else if let Some(current_entry_handles) =
-                        timelines.remove(&new_id.timeline_id)
-                    {
-                        warn!(
-                            "Readding to an existing timeline {new_id}, shutting the old wal receiver down"
-                        );
-                        if let Err(e) = current_entry_handles.shutdown(new_id).await {
-                            error!(
-                                "Failed to shut down timeline {new_id} wal receiver handle: {e:#}"
-                            );
+                    }
+
+                    let vacant_timeline_entry = match timelines.entry(new_id.timeline_id) {
+                        hash_map::Entry::Occupied(_) => {
+                            warn!("Attepted to readd an existing timeline {new_id}, ignoring");
                             return;
                         }
-                    }
+                        hash_map::Entry::Vacant(v) => v,
+                    };
 
                     let (wal_connect_timeout, lagging_wal_timeout, max_lsn_wal_lag) =
                         match fetch_tenant_settings(new_id.tenant_id).await {
@@ -279,13 +277,10 @@ async fn wal_receiver_main_thread_loop_step<'a>(
                         }
                     }.instrument(info_span!("timeline", id = %new_id)));
 
-                    timelines.insert(
-                        new_id.timeline_id,
-                        TimelineWalBrokerLoopHandles {
-                            broker_join_handle,
-                            cancellation_sender,
-                        },
-                    );
+                    vacant_timeline_entry.insert(TimelineWalBrokerLoopHandles {
+                        broker_join_handle,
+                        cancellation_sender,
+                    });
                 }
             }
         }
@@ -326,7 +321,7 @@ async fn exponential_backoff(n: u32, base: f64, max_seconds: f64) {
         return;
     }
     let seconds_to_wait = base.powf(f64::from(n) - 1.0).min(max_seconds);
-    info!("Backpressure: waiting {seconds_to_wait} seconds before proceeding with the task");
+    info!("Backoff: waiting {seconds_to_wait} seconds before proceeding with the task");
     tokio::time::sleep(Duration::from_secs_f64(seconds_to_wait)).await;
 }
 
@@ -377,12 +372,13 @@ struct TimelineWalBrokerLoopHandles {
 
 impl TimelineWalBrokerLoopHandles {
     /// Stops the broker loop, waiting for its current task to finish.
-    async fn shutdown(self, id: ZTenantTimelineId) -> anyhow::Result<()> {
+    async fn shutdown(&mut self, id: ZTenantTimelineId) -> anyhow::Result<()> {
         self.cancellation_sender.send(()).context(
             "Unexpected: cancellation sender is dropped before the receiver in the loop is",
         )?;
         debug!("Waiting for wal receiver for timeline {id} to finish");
-        self.broker_join_handle
+        let handle = &mut self.broker_join_handle;
+        handle
             .await
             .with_context(|| format!("Failed to join the wal reveiver broker for timeline {id}"))
     }
@@ -506,7 +502,6 @@ struct WalConnectionManager {
 
 #[derive(Debug)]
 struct WalConnectionData {
-    wal_producer_connstr: String,
     safekeeper_id: NodeId,
     connection: WalReceiverConnection,
     connection_init_time: NaiveDateTime,
@@ -524,9 +519,6 @@ struct NewWalConnectionCandidate {
 #[derive(Debug, PartialEq, Eq)]
 enum ReconnectReason {
     NoExistingConnection,
-    ConnectionStringUpdate {
-        old: String,
-    },
     LaggingWal {
         current_lsn: Lsn,
         new_lsn: Lsn,
@@ -591,9 +583,12 @@ impl WalConnectionManager {
 
     /// Shuts down current connection (if any), waiting for it to finish.
     async fn close_connection(&mut self) {
-        if let Some(data) = self.wal_connection_data.take() {
-            if let Err(e) = data.connection.shutdown().await {
-                error!("Failed to shutdown wal receiver connection: {e:#}");
+        if let Some(data) = self.wal_connection_data.as_mut() {
+            match data.connection.shutdown().await {
+                Err(e) => {
+                    error!("Failed to shutdown wal receiver connection: {e:#}");
+                }
+                Ok(()) => self.wal_connection_data = None,
             }
         }
     }
@@ -606,7 +601,6 @@ impl WalConnectionManager {
     ) {
         self.close_connection().await;
         self.wal_connection_data = Some(WalConnectionData {
-            wal_producer_connstr: new_wal_producer_connstr.clone(),
             safekeeper_id: new_safekeeper_id,
             connection: WalReceiverConnection::open(
                 self.id,
@@ -623,7 +617,6 @@ impl WalConnectionManager {
     /// Returns a new candidate, if the current state is somewhat lagging, or `None` otherwise.
     /// The current rules for approving new candidates:
     /// * pick the safekeeper with biggest `commit_lsn` that's after than pageserver's latest Lsn for the timeline
-    /// * if the leader is the current SK and it has a different connection url — reconnect
     /// * if the leader is a different SK and either
     ///     * no WAL updates happened after certain time (either none since the connection time or none since the last event after the connection) — reconnect
     ///     * same time amount had passed since the connection, WAL updates happened recently, but the new leader SK has timeline Lsn way ahead of the old one — reconnect
@@ -661,57 +654,16 @@ impl WalConnectionManager {
                 reason: ReconnectReason::NoExistingConnection,
             }),
             Some(current_connection) => {
-                let same_safekeeper = current_connection.safekeeper_id == new_sk_id;
-
-                if same_safekeeper
-                    && (current_connection.wal_producer_connstr != new_wal_producer_connstr)
-                {
-                    debug!("WAL producer connection string changed, old: '{}', new: '{new_wal_producer_connstr}', reconnecting",
-                            current_connection.wal_producer_connstr);
-                    return Some(NewWalConnectionCandidate {
-                        safekeeper_id: new_sk_id,
-                        wal_producer_connstr: new_wal_producer_connstr,
-                        reason: ReconnectReason::ConnectionStringUpdate {
-                            old: current_connection.wal_producer_connstr.clone(),
-                        },
-                    });
-                } else if !same_safekeeper {
-                    let candidate = self
-                        .reason_to_reconnect(current_connection, new_sk_timeline)
+                if current_connection.safekeeper_id == new_sk_id {
+                    None
+                } else {
+                    self.reason_to_reconnect(current_connection, new_sk_timeline)
                         .map(|reason| NewWalConnectionCandidate {
                             safekeeper_id: new_sk_id,
                             wal_producer_connstr: new_wal_producer_connstr,
                             reason,
-                        });
-                    if candidate.is_some() {
-                        return candidate;
-                    } else if let Some(wal_producer_connstr_from_broker) = safekeeper_timelines
-                        .get(&current_connection.safekeeper_id)
-                        .and_then(|info| {
-                            wal_stream_connection_string(
-                                self.id,
-                                info.safekeeper_connstr.as_deref()?,
-                                info.pageserver_connstr.as_deref()?,
-                            )
-                            .ok()
                         })
-                    {
-                        if current_connection.wal_producer_connstr
-                            != wal_producer_connstr_from_broker
-                        {
-                            debug!("WAL producer connection string changed, old: '{}', new: '{wal_producer_connstr_from_broker}', reconnecting",
-                                    current_connection.wal_producer_connstr);
-                            return Some(NewWalConnectionCandidate {
-                                safekeeper_id: current_connection.safekeeper_id,
-                                wal_producer_connstr: wal_producer_connstr_from_broker,
-                                reason: ReconnectReason::ConnectionStringUpdate {
-                                    old: current_connection.wal_producer_connstr.clone(),
-                                },
-                            });
-                        }
-                    }
                 }
-                None
             }
         }
     }
@@ -1052,96 +1004,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_url_switch() -> anyhow::Result<()> {
-        let harness = RepoHarness::create("connection_url_switch")?;
-        let connected_sk_id = NodeId(0);
-        let current_lsn = 100_000;
-
-        let mut data_manager_with_connection = dummy_wal_connection_manager(&harness);
-        let mut dummy_connection_data = dummy_connection_data(
-            ZTenantTimelineId {
-                tenant_id: harness.tenant_id,
-                timeline_id: TIMELINE_ID,
-            },
-            connected_sk_id,
-        )
-        .await;
-        let current_wal_producer_connstr = dummy_connection_data.wal_producer_connstr.clone();
-        let now = Utc::now().naive_utc();
-        dummy_connection_data.last_wal_receiver_data = Some((
-            ZenithFeedback {
-                current_timeline_size: 1,
-                ps_writelsn: 1,
-                ps_applylsn: current_lsn,
-                ps_flushlsn: 1,
-                ps_replytime: SystemTime::now(),
-            },
-            now,
-        ));
-        dummy_connection_data.connection_init_time = now;
-        data_manager_with_connection.wal_connection_data = Some(dummy_connection_data);
-
-        let new_sk_connstr = "new_sk_connstr";
-        let new_pg_connstr = "new_pg_connstr";
-        let changed_connection_url_candidate = data_manager_with_connection
-            .select_connection_candidate(HashMap::from([
-                (
-                    connected_sk_id,
-                    SkTimelineInfo {
-                        last_log_term: None,
-                        flush_lsn: None,
-                        commit_lsn: Some(Lsn(current_lsn)),
-                        s3_wal_lsn: None,
-                        remote_consistent_lsn: None,
-                        peer_horizon_lsn: None,
-                        safekeeper_connstr: Some(new_sk_connstr.to_string()),
-                        pageserver_connstr: Some(new_pg_connstr.to_string()),
-                    },
-                ),
-                (
-                    NodeId(1),
-                    SkTimelineInfo {
-                        last_log_term: None,
-                        flush_lsn: None,
-                        commit_lsn: Some(Lsn(
-                            current_lsn + (data_manager_with_connection.max_lsn_wal_lag.get() / 2)
-                        )),
-                        s3_wal_lsn: None,
-                        remote_consistent_lsn: None,
-                        peer_horizon_lsn: None,
-                        safekeeper_connstr: Some(
-                            "advanced below threshold by Lsn safekeeper".to_string(),
-                        ),
-                        pageserver_connstr: Some(
-                            "advanced below threshold by Lsn safekeeper".to_string(),
-                        ),
-                    },
-                ),
-            ]))
-            .expect(
-                "Expected one candidate selected out of multiple valid data options, but got none",
-            );
-
-        assert_eq!(
-            changed_connection_url_candidate.safekeeper_id,
-            connected_sk_id
-        );
-        assert_eq!(
-            changed_connection_url_candidate.reason,
-            ReconnectReason::ConnectionStringUpdate { old: current_wal_producer_connstr },
-            "Should reconnect if the safekeeper currently connected to changes its conneciton url, even if the other safekeepers have more advanced WAL (but not over threshold)"
-        );
-        assert!(changed_connection_url_candidate
-            .wal_producer_connstr
-            .contains(new_sk_connstr));
-        assert!(changed_connection_url_candidate
-            .wal_producer_connstr
-            .contains(new_pg_connstr));
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn lsn_wal_over_threshhold_current_candidate() -> anyhow::Result<()> {
         let harness = RepoHarness::create("lsn_wal_over_threshcurrent_candidate")?;
         let current_lsn = Lsn(100_000).align();
@@ -1169,8 +1031,6 @@ mod tests {
             time_over_threshold,
         ));
         dummy_connection_data.connection_init_time = time_over_threshold;
-        dummy_connection_data.wal_producer_connstr =
-            wal_stream_connection_string(id, DUMMY_SAFEKEEPER_CONNSTR, DUMMY_PAGESERVER_CONNSTR)?;
         data_manager_with_connection.wal_connection_data = Some(dummy_connection_data);
 
         let new_lsn = Lsn(current_lsn.0 + data_manager_with_connection.max_lsn_wal_lag.get() + 1);
@@ -1261,8 +1121,6 @@ mod tests {
             Utc::now().naive_utc() - lagging_wal_timeout - lagging_wal_timeout;
         dummy_connection_data.last_wal_receiver_data = None;
         dummy_connection_data.connection_init_time = time_over_threshold;
-        dummy_connection_data.wal_producer_connstr =
-            wal_stream_connection_string(id, DUMMY_SAFEKEEPER_CONNSTR, DUMMY_PAGESERVER_CONNSTR)?;
         data_manager_with_connection.wal_connection_data = Some(dummy_connection_data);
 
         let new_lsn = Lsn(current_lsn.0 + data_manager_with_connection.max_lsn_wal_lag.get() + 1);
@@ -1355,7 +1213,6 @@ mod tests {
             wal_stream_connection_string(id, DUMMY_SAFEKEEPER_CONNSTR, DUMMY_PAGESERVER_CONNSTR)
                 .expect("Failed to construct dummy wal producer connstr");
         WalConnectionData {
-            wal_producer_connstr: dummy_connstr.clone(),
             safekeeper_id,
             connection: WalReceiverConnection::open(
                 id,

@@ -2,6 +2,7 @@
 //! Runs as a separate, cancellable Tokio task.
 use std::{
     str::FromStr,
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -104,9 +105,10 @@ impl WalReceiverConnection {
     }
 
     /// Gracefully aborts current WAL streaming task, waiting for the current WAL streamed.
-    pub async fn shutdown(self) -> anyhow::Result<()> {
+    pub async fn shutdown(&mut self) -> anyhow::Result<()> {
         self.cancellation.send(()).ok();
-        self.handle
+        let handle = &mut self.handle;
+        handle
             .await
             .context("Failed to join on a walreceiver connection task")?;
         Ok(())
@@ -156,7 +158,7 @@ async fn handle_walreceiver_connection(
         .instrument(info_span!("safekeeper_handle_db")),
     );
 
-    // Immediately increment the gauge, then create a job to decrement it on thread exit.
+    // Immediately increment the gauge, then create a job to decrement it on task exit.
     // One of the pros of `defer!` is that this will *most probably*
     // get called, even in presence of panics.
     let gauge = crate::LIVE_CONNECTIONS_COUNT.with_label_values(&["wal_receiver"]);
@@ -257,7 +259,15 @@ async fn handle_walreceiver_connection(
                     caught_up = true;
                 }
 
-                timeline.tline.check_checkpoint_distance()?;
+                let timeline_to_check = Arc::clone(&timeline.tline);
+                tokio::task::spawn_blocking(move || timeline_to_check.check_checkpoint_distance())
+                    .await
+                    .with_context(|| {
+                        format!("Spawned checkpoint check task panicked for timeline {id}")
+                    })?
+                    .with_context(|| {
+                        format!("Failed to check checkpoint distance for timeline {id}")
+                    })?;
 
                 Some(endlsn)
             }

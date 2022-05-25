@@ -407,15 +407,20 @@ pub fn get_local_timeline_with_load(
         .with_context(|| format!("Tenant {tenant_id} not found"))?;
 
     if let Some(page_tline) = tenant.local_timelines.get(&timeline_id) {
-        return Ok(Arc::clone(page_tline));
+        Ok(Arc::clone(page_tline))
+    } else {
+        let page_tline = new_local_timeline(&tenant.repo, timeline_id).with_context(|| {
+            format!("Failed to create new local timeline for tenant {tenant_id}")
+        })?;
+        tenant
+            .local_timelines
+            .insert(timeline_id, Arc::clone(&page_tline));
+        tenants_state::try_send_timeline_update(LocalTimelineUpdate::Attach(
+            ZTenantTimelineId::new(tenant_id, timeline_id),
+            Arc::clone(&page_tline),
+        ));
+        Ok(page_tline)
     }
-
-    let page_tline = new_local_timeline(&tenant.repo, timeline_id)
-        .with_context(|| format!("Failed to create new local timeline for tenant {tenant_id}"))?;
-    tenant
-        .local_timelines
-        .insert(timeline_id, Arc::clone(&page_tline));
-    Ok(page_tline)
 }
 
 pub fn detach_timeline(
