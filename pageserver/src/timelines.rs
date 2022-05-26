@@ -17,7 +17,7 @@ use tracing::*;
 use utils::{
     crashsafe_dir, logging,
     lsn::Lsn,
-    zid::{ZTenantId, ZTimelineId},
+    zid::{ZTenantId, ZTenantTimelineId, ZTimelineId},
 };
 
 use crate::{
@@ -26,6 +26,7 @@ use crate::{
     repository::{LocalTimelineState, Repository},
     storage_sync::index::RemoteIndex,
     tenant_config::TenantConfOpt,
+    tenant_mgr::LocalTimelineUpdate,
     DatadirTimeline, RepositoryImpl,
 };
 use crate::{import_datadir, LOG_FILE_NAME};
@@ -354,7 +355,7 @@ pub(crate) fn create_timeline(
 
     let mut start_lsn = ancestor_start_lsn.unwrap_or(Lsn(0));
 
-    let new_timeline_info = match ancestor_timeline_id {
+    let new_timeline = match ancestor_timeline_id {
         Some(ancestor_timeline_id) => {
             let ancestor_timeline = repo
                 .get_timeline_load(ancestor_timeline_id)
@@ -388,20 +389,23 @@ pub(crate) fn create_timeline(
             }
             repo.branch_timeline(ancestor_timeline_id, new_timeline_id, start_lsn)?;
             // load the timeline into memory
-            let loaded_timeline =
-                tenant_mgr::get_local_timeline_with_load(tenant_id, new_timeline_id)?;
-            LocalTimelineInfo::from_loaded_timeline(&loaded_timeline, false)
-                .context("cannot fill timeline info")?
+            tenant_mgr::get_local_timeline_with_load(tenant_id, new_timeline_id)?
         }
         None => {
             bootstrap_timeline(conf, tenant_id, new_timeline_id, repo.as_ref())?;
             // load the timeline into memory
-            let new_timeline =
-                tenant_mgr::get_local_timeline_with_load(tenant_id, new_timeline_id)?;
-            LocalTimelineInfo::from_loaded_timeline(&new_timeline, false)
-                .context("cannot fill timeline info")?
+            tenant_mgr::get_local_timeline_with_load(tenant_id, new_timeline_id)?
         }
     };
+
+    let new_timeline_info = LocalTimelineInfo::from_loaded_timeline(&new_timeline, false)
+        .context("cannot fill timeline info")?;
+
+    tenant_mgr::tenants_state::try_send_timeline_update(LocalTimelineUpdate::Attach(
+        ZTenantTimelineId::new(tenant_id, new_timeline_id),
+        Arc::clone(&new_timeline),
+    ));
+
     Ok(Some(TimelineInfo {
         tenant_id,
         timeline_id: new_timeline_id,

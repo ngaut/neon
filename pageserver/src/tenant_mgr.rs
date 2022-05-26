@@ -25,7 +25,7 @@ use tracing::*;
 
 use utils::zid::{ZTenantId, ZTenantTimelineId, ZTimelineId};
 
-mod tenants_state {
+pub mod tenants_state {
     use anyhow::ensure;
     use std::{
         collections::HashMap,
@@ -68,7 +68,7 @@ mod tenants_state {
         Ok(())
     }
 
-    pub(super) fn try_send_timeline_update(update: LocalTimelineUpdate) {
+    pub fn try_send_timeline_update(update: LocalTimelineUpdate) {
         match TIMELINE_UPDATE_SENDER
             .read()
             .expect("Failed to read() timeline_update_sender lock, it got poisoned")
